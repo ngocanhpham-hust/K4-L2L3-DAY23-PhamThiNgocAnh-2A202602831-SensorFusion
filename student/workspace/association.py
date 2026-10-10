@@ -11,6 +11,12 @@ from typing import Any
 from typing import Sequence
 
 import numpy as np
+from scipy.stats import chi2
+
+from fusion_lab.workspace_loader import load_workspace_module
+from fusion_lab.workspace_support import get_tracking_params
+
+kalman = load_workspace_module("kalman")
 
 # vi: from fusion_lab.workspace_support import get_tracking_params
 # vi: from fusion_lab.workspace_loader import load_workspace_module
@@ -27,10 +33,13 @@ def mahalanobis_distance(track: Any, meas: Any) -> float:
     Returns:
         Scalar squared Mahalanobis distance.
     """
-    # vi: TODO Part F — H = meas.sensor.get_H(track.x);
-    # vi: gamma = kalman.innovation(...); S = kalman.innovation_covariance(...);
-    # vi: return gamma.T @ inv(S) @ gamma (float scalar).
-    raise NotImplementedError("TODO: implement mahalanobis_distance")
+    jacobian = np.asmatrix(meas.sensor.get_H(track.x))
+    residual = np.asmatrix(kalman.innovation(track.x, meas))
+    covariance = np.asmatrix(
+        kalman.innovation_covariance(track.P, meas, jacobian)
+    )
+    solved = np.linalg.solve(np.asarray(covariance), np.asarray(residual))
+    return float((np.asarray(residual.T) @ solved).item())
 
 
 def chi2_gate(mhd_sq: float, sensor: Any) -> bool:
@@ -43,8 +52,9 @@ def chi2_gate(mhd_sq: float, sensor: Any) -> bool:
     Returns:
         True if inside gate.
     """
-    # vi: TODO Part F — ngưỡng chi2.ppf(gating_threshold, sensor.dim_meas) từ params.
-    raise NotImplementedError("TODO: implement chi2_gate")
+    params = get_tracking_params()
+    threshold = chi2.ppf(params.gating_threshold, sensor.dim_meas)
+    return bool(np.isfinite(mhd_sq) and mhd_sq <= threshold)
 
 
 def association_cost_matrix(
@@ -60,9 +70,15 @@ def association_cost_matrix(
         Cost matrix; ``np.inf`` for invisible tracks or rejected chi-square gates.
         Invisible pairs must never call the Mahalanobis/projection helpers.
     """
-    # vi: TODO Part F — khởi tạo toàn inf; kiểm tra meas.sensor.in_fov(track.x)
-    # vi: trước MHD (camera sau lưng/độ sâu 0 không được chiếu); rồi kiểm tra chi2.
-    raise NotImplementedError("TODO: implement association_cost_matrix")
+    costs = np.full((len(track_list), len(meas_list)), np.inf, dtype=float)
+    for track_index, track in enumerate(track_list):
+        for measurement_index, measurement in enumerate(meas_list):
+            if not measurement.sensor.in_fov(track.x):
+                continue
+            distance = mahalanobis_distance(track, measurement)
+            if chi2_gate(distance, measurement.sensor):
+                costs[track_index, measurement_index] = distance
+    return np.asmatrix(costs)
 
 
 def pick_next_pair(
@@ -81,9 +97,19 @@ def pick_next_pair(
         Tuple (track, meas, new_matrix, remaining_tracks, remaining_meas).
         If no finite pair exists, return np.nan for track and meas and retain both lists.
     """
-    # vi: TODO Part F — chỉ lấy cặp hữu hạn nhỏ nhất rồi xóa hàng/cột tương ứng;
-    # vi: ma trận rỗng/toàn inf: trả np.nan, np.nan và giữ các danh sách chưa ghép.
-    raise NotImplementedError("TODO: implement pick_next_pair")
+    matrix = np.asmatrix(association_matrix)
+    remaining_tracks = list(unassigned_tracks)
+    remaining_meas = list(unassigned_meas)
+    if matrix.size == 0 or not np.isfinite(np.asarray(matrix)).any():
+        return np.nan, np.nan, matrix, remaining_tracks, remaining_meas
+
+    flat_index = int(np.nanargmin(np.asarray(matrix)))
+    track_index, measurement_index = np.unravel_index(flat_index, matrix.shape)
+    track = remaining_tracks.pop(track_index)
+    measurement = remaining_meas.pop(measurement_index)
+    reduced = np.delete(np.delete(np.asarray(matrix), track_index, axis=0),
+                        measurement_index, axis=1)
+    return track, measurement, np.asmatrix(reduced), remaining_tracks, remaining_meas
 
 
 def associate_and_update(
@@ -105,8 +131,17 @@ def associate_and_update(
         Visibility is handled in the cost matrix, before pair removal. Camera
         updates refine state only; lidar hits alone increase existence scores.
     """
-    # vi: TODO Part F — kể cả meas_list rỗng, vẫn gọi quản lý cuối lượt.
-    # vi: Ghép cặp hữu hạn, filter_obj.update rồi handle_updated_track(track, sensor).
-    # vi: Không bỏ qua FOV sau khi đã xóa cặp khỏi danh sách chưa ghép.
-    # vi: Kết thúc manager.manage_tracks(unassigned_tracks, unassigned_meas, sensor).
-    raise NotImplementedError("TODO: implement associate_and_update")
+    unassigned_tracks = list(manager.track_list)
+    unassigned_meas = list(meas_list)
+    association_matrix = association_cost_matrix(unassigned_tracks, unassigned_meas)
+
+    while True:
+        track, measurement, association_matrix, unassigned_tracks, unassigned_meas = (
+            pick_next_pair(association_matrix, unassigned_tracks, unassigned_meas)
+        )
+        if isinstance(track, (float, np.floating)) and np.isnan(track):
+            break
+        filter_obj.update(track, measurement)
+        manager.handle_updated_track(track, sensor)
+
+    manager.manage_tracks(unassigned_tracks, unassigned_meas, sensor)
