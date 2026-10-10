@@ -11,6 +11,8 @@ from typing import Sequence
 
 import numpy as np
 
+from fusion_lab.workspace_support import get_tracking_params
+
 Matrix = np.matrix | np.ndarray
 
 # vi: from fusion_lab.workspace_support import get_tracking_params
@@ -28,10 +30,18 @@ def is_in_field_of_view(x: Matrix, sensor: Any) -> bool:
         True if sensor coordinates are finite and the horizontal angle is within
         ``sensor.fov``. A camera additionally requires depth > 1e-6.
     """
-    # vi: TODO Part G — p_s = R @ p + t; loại tọa độ không hữu hạn.
-    # vi: Camera cần x_s > 1e-6; FOV từ nội tại và bề rộng ảnh.
-    # vi: Với cả lidar/camera: kiểm tra atan2(y_s, x_s) nằm trong sensor.fov.
-    raise NotImplementedError("TODO: implement is_in_field_of_view")
+    position = np.asarray(x, dtype=float).reshape(-1)[:3]
+    transform = np.asarray(sensor.veh_to_sens, dtype=float)
+    sensor_position = transform[:3, :3] @ position + transform[:3, 3]
+    if not np.isfinite(sensor_position).all():
+        return False
+    if sensor.name == "camera":
+        minimum_depth = float(getattr(sensor, "depth_epsilon", 1e-6))
+        if sensor_position[0] <= minimum_depth:
+            return False
+    horizontal_angle = float(np.arctan2(sensor_position[1], sensor_position[0]))
+    lower, upper = map(float, sensor.fov)
+    return lower <= horizontal_angle <= upper
 
 
 def camera_measurement_prediction(x: Matrix, sensor: Any) -> Matrix:
@@ -48,10 +58,19 @@ def camera_measurement_prediction(x: Matrix, sensor: Any) -> Matrix:
         ValueError: With coordinate context if sensor coordinates are nonfinite
             or depth is at most 1e-6.
     """
-    # vi: TODO Part G — tính p_s = R @ p + t; trước phép chia kiểm tra hữu hạn
-    # vi: và x_s > 1e-6, ngược lại raise ValueError có tọa độ.
-    # vi: u = c_i - f_i * y_s/x_s; v = c_j - f_j * z_s/x_s.
-    raise NotImplementedError("TODO: implement camera_measurement_prediction")
+    position = np.asarray(x, dtype=float).reshape(-1)[:3]
+    transform = np.asarray(sensor.veh_to_sens, dtype=float)
+    sensor_position = transform[:3, :3] @ position + transform[:3, 3]
+    minimum_depth = float(getattr(sensor, "depth_epsilon", 1e-6))
+    if not np.isfinite(sensor_position).all() or sensor_position[0] <= minimum_depth:
+        raise ValueError(
+            "Camera projection needs finite coordinates and positive depth "
+            f"> {minimum_depth:g}; sensor position={sensor_position.tolist()}"
+        )
+    depth, left, up = sensor_position
+    pixel_i = sensor.c_i - sensor.f_i * left / depth
+    pixel_j = sensor.c_j - sensor.f_j * up / depth
+    return np.asmatrix([[pixel_i], [pixel_j]], dtype=float)
 
 
 def build_camera_measurement(z: Sequence[float], sensor: Any) -> dict[str, Any]:
@@ -64,5 +83,13 @@ def build_camera_measurement(z: Sequence[float], sensor: Any) -> dict[str, Any]:
     Returns:
         Dict with keys ``z``, ``R``, ``sensor``.
     """
-    # vi: TODO Part G — z mat 2x1; R diag sigma_cam_i^2, sigma_cam_j^2 từ params.
-    raise NotImplementedError("TODO: implement build_camera_measurement")
+    values = np.asarray(z, dtype=float).reshape(-1)
+    if values.size < 2 or not np.isfinite(values[:2]).all():
+        raise ValueError(f"Camera measurement needs two finite pixels; received {values.tolist()}")
+    params = get_tracking_params()
+    covariance = np.diag([params.sigma_cam_i**2, params.sigma_cam_j**2])
+    return {
+        "z": np.asmatrix(values[:2]).T,
+        "R": np.asmatrix(covariance),
+        "sensor": sensor,
+    }
